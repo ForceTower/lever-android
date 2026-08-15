@@ -30,7 +30,7 @@ jobs:
       # committed dump, and the consumer fixture's minified release build.
       - run: ./gradlew build --stacktrace
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: reports
@@ -105,7 +105,7 @@ jobs:
 
       - run: ./gradlew :lever:smokeApi30DebugAndroidTest --stacktrace
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: instrumented-reports
