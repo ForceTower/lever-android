@@ -99,9 +99,19 @@ public object Lever {
     /**
      * Test-only: the singleton is process-global, so its suite needs a way back
      * to the unconfigured state. The production [IllegalStateException]s stay
-     * intact.
+     * intact — including the one that refuses to close `shared`, which is why
+     * uninstalling is the only place that may.
      */
     internal fun resetForTesting() {
-        lock.withLock { installation = Installation.Empty }
+        val installed =
+            lock.withLock {
+                val current = installation as? Installation.Installed
+                installation = Installation.Empty
+                current?.client
+            }
+        installed?.let {
+            it.isSharedInstance = false
+            it.close()
+        }
     }
 }

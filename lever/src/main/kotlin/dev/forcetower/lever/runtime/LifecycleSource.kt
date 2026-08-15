@@ -32,13 +32,20 @@ internal interface LifecycleSource {
     fun phases(): Flow<LifecyclePhase>
 
     /**
-     * Removes the platform observer and, on any thread that is not itself
-     * blocking the main thread, does not return until it is gone.
+     * Detaches from the platform's lifecycle, in two parts with different
+     * guarantees (spec 0003 §4):
      *
-     * Cancelling the collecting coroutine only *queues* the removal, and
-     * `close()` promises release rather than a scheduled intention
-     * (spec 0003 §4). Idempotent, and safe to call before the observer has
-     * finished installing.
+     * - **Callbacks stop immediately**, synchronously, before this returns.
+     *   Nothing the platform reports afterwards reaches the SDK.
+     * - **The observer registration is removed before this returns**, unless
+     *   the main thread is unavailable — removal is a main-thread-only API, so
+     *   a blocked main thread would otherwise turn one client's teardown into a
+     *   hang. In that case the removal stays queued and runs when the main
+     *   thread frees up, against an observer that is already inert.
+     *
+     * Cancelling the collecting coroutine only *queues* both, which is why this
+     * exists. Idempotent, and safe to call before the observer has finished
+     * installing.
      */
     fun detach() {}
 }
@@ -63,12 +70,15 @@ internal class ProcessLifecycleSource(private val sink: LeverLogSink) : Lifecycl
             val handler = Handler(Looper.getMainLooper())
             val observer =
                 object : DefaultLifecycleObserver {
+                    // Detach suppresses callbacks *here*, so suppression does not
+                    // depend on the removal having run — the removal can only be
+                    // as prompt as the main thread allows, and this cannot.
                     override fun onStart(owner: LifecycleOwner) {
-                        trySend(LifecyclePhase.FOREGROUND)
+                        if (!detached.get()) trySend(LifecyclePhase.FOREGROUND)
                     }
 
                     override fun onStop(owner: LifecycleOwner) {
-                        trySend(LifecyclePhase.BACKGROUND)
+                        if (!detached.get()) trySend(LifecyclePhase.BACKGROUND)
                     }
                 }
 
@@ -119,10 +129,11 @@ internal class ProcessLifecycleSource(private val sink: LeverLogSink) : Lifecycl
             removed.countDown()
         }
         if (!removed.await(DETACH_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
-            // Only reachable when the main thread is blocked by something else:
-            // removal stays queued and runs when it frees up, and until then the
-            // observer can only feed a flow that is already cancelled. Waiting
-            // longer would turn someone else's stall into this client's hang.
+            // Only reachable when the main thread is blocked by something else.
+            // The observer is already inert — it stopped emitting the moment
+            // `detached` was set — so what is left queued is the registration
+            // itself. Waiting longer would turn someone else's stall into this
+            // client's hang, which is the worse of the two failures.
             sink.warn("lifecycle observer removal is waiting on a blocked main thread")
         }
     }

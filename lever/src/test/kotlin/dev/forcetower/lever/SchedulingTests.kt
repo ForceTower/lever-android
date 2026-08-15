@@ -310,17 +310,24 @@ internal class SchedulingTests {
             TestHarness(testScheduler, dispatcher = runtime.dispatcher, onShutdown = runtime.shutdown)
                 .also { harnesses.add(it) }
 
+        // Other suites hold live clients of their own, so this watches the
+        // thread *this* runtime started rather than every thread sharing a name.
+        val before = runtimeThreads()
         val client = harness.client(harness.configuration(automaticUpdates = false))
         client.stage(Representation(1, mapOf("flag" to wireBool(true)), null, harness.now, null))
         assertTrue(client.activate())
-        assertTrue(runtimeThreads() > 0, "the runtime thread never started")
+
+        val started = runtimeThreads() - before
+        assertTrue(started.isNotEmpty(), "the runtime thread never started")
 
         client.close()
         val deadline = System.nanoTime() + 10_000_000_000
-        while (runtimeThreads() > 0 && System.nanoTime() < deadline) Thread.sleep(10)
-        assertEquals(0, runtimeThreads(), "the runtime thread leaked")
+        while (started.any { it.isAlive } && System.nanoTime() < deadline) Thread.sleep(10)
+        assertTrue(started.none { it.isAlive }, "the runtime thread leaked")
     }
 
-    private fun runtimeThreads(): Int =
-        Thread.getAllStackTraces().keys.count { it.name == "lever-runtime" && it.isAlive }
+    private fun runtimeThreads(): Set<Thread> =
+        Thread.getAllStackTraces().keys.filterTo(mutableSetOf()) {
+            it.name == "lever-runtime" && it.isAlive
+        }
 }

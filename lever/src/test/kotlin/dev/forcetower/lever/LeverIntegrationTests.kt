@@ -178,6 +178,43 @@ internal class LeverIntegrationTests {
     }
 
     /**
+     * When the main thread is unavailable the registration removal has to wait
+     * for it, but the callbacks do not: an observer that is still registered
+     * must already be inert (spec 0003 §4).
+     */
+    @Test
+    fun `detach suppresses callbacks even while the removal is still queued`() = runTest {
+        val registry = ProcessLifecycleOwner.get().lifecycle as LifecycleRegistry
+        val baseline = registry.observerCount
+        val phases = mutableListOf<LifecyclePhase>()
+
+        val source = ProcessLifecycleSource { _, _ -> }
+        val job = backgroundScope.launch { source.phases().collect { phases.add(it) } }
+        testScheduler.runCurrent()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        testScheduler.runCurrent()
+        val installed = phases.toList()
+        assertEquals(1, installed.size, "the initial phase never arrived")
+
+        // Detach from another thread and leave the main looper idle-less, which
+        // is what a blocked main thread looks like: the removal stays queued and
+        // the observer is still registered.
+        val detacher = Thread { source.detach() }.apply { start() }
+        Thread.sleep(50)
+        assertEquals(baseline + 1, registry.observerCount, "the observer was already removed")
+
+        // The platform reports a transition to the still-registered observer.
+        registry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+        testScheduler.runCurrent()
+        assertEquals(installed, phases, "a callback escaped a detached source")
+
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        detacher.join(10_000)
+        assertEquals(baseline, registry.observerCount, "the queued removal never ran")
+        job.cancel()
+    }
+
+    /**
      * `close()` promises release, not a queued intention: the observer is gone
      * when it returns, with no looper idling afterwards to help it along
      * (review 0003 pass 3, P3-F3).
