@@ -35,8 +35,10 @@ internal data class CachedSnapshot(
  * snapshot). Nothing here throws: a cache is a floor, not a dependency.
  *
  * There are no Android APIs in this codec — it is `java.io`/`java.nio` only, so
- * the storage suites run as plain JVM tests against temp directories, and
- * `Files.createLink` is the same `link(2)` an Android app gets on API 26+.
+ * the storage suites run as plain JVM tests against temp directories. That
+ * portability has a limit worth remembering: the host JVM permits filesystem
+ * operations Android's app-private storage does not, so a publication primitive
+ * is only proven by the instrumented suite.
  */
 internal class CacheStore(
     val directory: File,
@@ -54,10 +56,12 @@ internal class CacheStore(
      * reshuffled on every credential rotation would re-randomize every
      * percentage rollout (spec 0002 §7).
      *
-     * First creation publishes with a **hard link**, and the loser of a race
-     * re-reads the winner's file.
+     * First creation publishes with an **atomic rename**, and the loser of a
+     * race re-reads the winner's file.
      */
-    fun loadOrCreateClientId(): String {
+    fun loadOrCreateClientId(): String = synchronized(publication) { createOrLoadIdentity() }
+
+    private fun createOrLoadIdentity(): String {
         createDirectory()
 
         readIdentity()?.let { return it }
@@ -69,7 +73,10 @@ internal class CacheStore(
             Publication.CREATED -> generated
             // Someone else won; their identity is the one on disk.
             Publication.ALREADY_EXISTS -> readIdentity() ?: overwriteIdentity(generated)
-            Publication.FAILED -> generated
+            // Nothing was published, so a readable file can only be someone
+            // else's — preferring it keeps a failed write from minting a second
+            // identity for an installation that already has one.
+            Publication.FAILED -> readIdentity() ?: generated
         }
     }
 
@@ -126,19 +133,26 @@ internal class CacheStore(
     private enum class Publication { CREATED, ALREADY_EXISTS, FAILED }
 
     /**
-     * Write-then-`link`, not an exclusive create.
+     * Write-then-rename, not an exclusive create.
      *
      * An exclusive create publishes the *name* before the bytes, so a racing
      * reader can find an empty file, decide it is corrupt, and overwrite the
-     * winner's identity with its own. A hard link publishes a fully written
-     * file in one atomic step, which makes "the file exists" mean "the file is
-     * complete" — the property the loser's re-read depends on (spec 0002 §12).
+     * winner's identity with its own. A rename publishes a fully written file in
+     * one atomic step, which makes "the file exists" mean "the file is complete"
+     * — the property the loser's re-read depends on (spec 0002 §12).
+     *
+     * It is `rename(2)` rather than the `link(2)` this originally used because
+     * Android refuses hard links inside app-private storage with
+     * `AccessDeniedException`: the link form never published at all, failing on
+     * the *first* write and handing back an identity that had never reached
+     * disk. Only the instrumented suite could catch that — the host JVM the
+     * storage tests run on permits links.
      */
     private fun publishExclusively(payload: String): Publication {
         val temporary = File(directory, ".identity-${UUID.randomUUID()}.tmp")
         return try {
             temporary.writeText(payload)
-            Files.createLink(path(identityFile), path(temporary))
+            Files.move(path(temporary), path(identityFile))
             Publication.CREATED
         } catch (_: FileAlreadyExistsException) {
             Publication.ALREADY_EXISTS
@@ -256,6 +270,19 @@ internal class CacheStore(
 
     private companion object {
         const val SCHEMA_VERSION = 1
+
+        /**
+         * Held across the whole read-or-create, and shared by every [CacheStore]
+         * because racing initializers are separate instances over one directory.
+         *
+         * `rename(2)` publishes atomically but does not *arbitrate*: a move
+         * without `REPLACE_EXISTING` is a check followed by a rename, so two
+         * threads can both find the name free and the second silently replaces
+         * the first — which is one identity persisted and two handed out. The
+         * lock makes the in-process case, the one an app actually hits when
+         * several entry points initialize at once, exact.
+         */
+        val publication = Any()
     }
 }
 
