@@ -9,6 +9,7 @@ import dev.forcetower.lever.runtime.LeverRuntime
 import dev.forcetower.lever.storage.CacheStore
 import dev.forcetower.lever.storage.CachedSnapshot
 import java.io.File
+import java.util.WeakHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.locks.ReentrantLock
@@ -80,6 +81,7 @@ public class LeverClient internal constructor(
      */
     private val decodeGates = ConcurrentHashMap<MemoKey, ReentrantLock>()
     private val gate = CommitGate()
+    private val calloutsDrained = lock.newCondition()
     private val now: () -> Long = environment.now
     private val runtime = LeverRuntime(config, environment)
 
@@ -93,6 +95,12 @@ public class LeverClient internal constructor(
      * which is where the close-linearization tests need a barrier.
      */
     internal var afterStateLock: ((Long) -> Unit)? = null
+
+    /**
+     * Test seam: runs after a read diagnostic has been admitted but before it
+     * reaches the sink — the window `close()` has to drain.
+     */
+    internal var beforeReadLog: (() -> Unit)? = null
 
     init {
         // Both before anything asynchronous exists: the identity must be there
@@ -122,7 +130,14 @@ public class LeverClient internal constructor(
          * cannot install a stale memo entry.
          */
         var generation: Long = 0
-        val memo = mutableMapOf<MemoKey, MemoEntry>()
+        /**
+         * Keyed by the key **instance**, so two keys that collide on
+         * `(name, typeId)` keep their own entries instead of evicting each
+         * other on every alternating read. Weak, because a caller who builds
+         * keys ad hoc instead of declaring them once must not grow this map
+         * without bound.
+         */
+        val memo = WeakHashMap<LeverKey<*>, MemoEntry>()
         val logged = mutableSetOf<LogKey>()
 
         /**
@@ -142,6 +157,13 @@ public class LeverClient internal constructor(
         var closeState = CloseState.OPEN
         var closeBarrier: CountDownLatch? = null
 
+        /**
+         * Read diagnostics that have left the lock but not yet reached the
+         * sink. `close()` drains them, so a callout can never *begin* before
+         * the mark and still be running after `close()` returns.
+         */
+        var readCallouts = 0
+
         val isClosed: Boolean get() = closeState != CloseState.OPEN
     }
 
@@ -150,13 +172,13 @@ public class LeverClient internal constructor(
     private data class MemoKey(val name: String, val typeId: String)
 
     /**
-     * A decoded `json` value and the key instance that decoded it. The token is
-     * checked by identity on every hit: [MemoKey] can collide (two keys over one
-     * wire name whose serializers share a descriptor name), and serving one
-     * key's object to another would throw `ClassCastException` in the caller
-     * under erasure — a read that promises never to throw.
+     * A decoded `json` value. It is reached only through its own key instance,
+     * which is what keeps one key's object from ever being served to another:
+     * a serializer's descriptor name is not a type identity, and under erasure
+     * the mix-up would surface as `ClassCastException` in the caller — from a
+     * read that promises never to throw.
      */
-    private class MemoEntry(val token: Any, val value: Any?)
+    private class MemoEntry(val value: Any?)
 
     /**
      * `typeId` is `null` for absence, which dedupes per `(key, version)`; a
@@ -180,10 +202,9 @@ public class LeverClient internal constructor(
      */
     public fun <V> value(key: LeverKey<V>): V {
         // The fast path a hot read site takes: one lock-protected map lookup.
-        if (!key.memoizes) return resolve(key, memoKey = null)
+        if (!key.memoizes) return resolve(key, memoize = false)
 
-        val memoKey = MemoKey(key.name, key.typeId)
-        memoEntry(memoKey, key)?.let {
+        memoEntry(key)?.let {
             @Suppress("UNCHECKED_CAST")
             return it.value as V
         }
@@ -192,22 +213,25 @@ public class LeverClient internal constructor(
         // wait for its result rather than decoding again. Neither the state lock
         // nor the commit gate is held here, so the decoder is free to be slow —
         // and free to read other flags (spec 0002 §4.1).
-        return decodeGates.computeIfAbsent(memoKey) { ReentrantLock() }.withLock {
-            val entry = memoEntry(memoKey, key)
-            if (entry != null) {
-                @Suppress("UNCHECKED_CAST")
-                entry.value as V
-            } else {
-                resolve(key, memoKey)
+        // The gate stays coarse — one lock per `(name, type)` rather than per
+        // key — because colliding keys only serialize each other here, and a
+        // per-instance gate map would grow with every ad-hoc key.
+        return decodeGates.computeIfAbsent(MemoKey(key.name, key.typeId)) { ReentrantLock() }
+            .withLock {
+                val entry = memoEntry(key)
+                if (entry != null) {
+                    @Suppress("UNCHECKED_CAST")
+                    entry.value as V
+                } else {
+                    resolve(key, memoize = true)
+                }
             }
-        }
     }
 
     /** The memoized value for this exact key, or `null` when there is none. */
-    private fun <V> memoEntry(memoKey: MemoKey, key: LeverKey<V>): MemoEntry? =
-        lock.withLock { state.memo[memoKey] }?.takeIf { it.token === key }
+    private fun <V> memoEntry(key: LeverKey<V>): MemoEntry? = lock.withLock { state.memo[key] }
 
-    private fun <V> resolve(key: LeverKey<V>, memoKey: MemoKey?): V {
+    private fun <V> resolve(key: LeverKey<V>, memoize: Boolean): V {
         var raw: WireValue? = null
         var version: Int? = null
         var generation = 0L
@@ -224,12 +248,12 @@ public class LeverClient internal constructor(
         val values = if (present == null) emptyMap() else mapOf(key.name to present)
         return when (val outcome = resolveRead(key, values)) {
             is ReadOutcome.Resolved -> {
-                if (memoKey != null) {
+                if (memoize) {
                     lock.withLock {
                         // A decode that raced an activation must not install a
                         // stale memo entry into the newer representation.
                         if (state.generation == generation) {
-                            state.memo[memoKey] = MemoEntry(key, outcome.value)
+                            state.memo[key] = MemoEntry(outcome.value)
                         }
                     }
                 }
@@ -411,6 +435,9 @@ public class LeverClient internal constructor(
 
         try {
             gate.awaitDrain(admitted)
+            // Read diagnostics live outside the commit gate — they are reads,
+            // not commits — so they are drained on their own.
+            lock.withLock { while (state.readCallouts > 0) calloutsDrained.awaitUninterruptibly() }
 
             val collectors =
                 lock.withLock {
@@ -540,9 +567,29 @@ public class LeverClient internal constructor(
      * new sink callback: "no sink invocation begins after `close()` returns" is
      * the boundary, and a first post-close absent or mismatched read would
      * otherwise cross it (spec 0003 §4).
+     *
+     * Refusing new callouts is only half of it. A read that passed the check
+     * microseconds before `close()` began would still reach the sink after it
+     * returned, so the callout is registered under the lock and `close()` waits
+     * for the ones already in flight.
      */
     private fun logOnce(key: LogKey, level: LeverLogLevel, message: () -> String) {
-        val isFirst = lock.withLock { !state.isClosed && state.logged.add(key) }
-        if (isFirst) config.logSink.log(level, message())
+        val isFirst =
+            lock.withLock {
+                if (state.isClosed || !state.logged.add(key)) return@withLock false
+                state.readCallouts++
+                true
+            }
+        if (!isFirst) return
+
+        try {
+            beforeReadLog?.invoke()
+            config.logSink.log(level, message())
+        } finally {
+            lock.withLock {
+                state.readCallouts--
+                if (state.readCallouts == 0) calloutsDrained.signalAll()
+            }
+        }
     }
 }

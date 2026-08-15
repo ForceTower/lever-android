@@ -117,7 +117,7 @@ internal class LeverIntegrationTests {
         val before = registry.observerCount
 
         val phases = mutableListOf<LifecyclePhase>()
-        val job = backgroundScope.launch { ProcessLifecycleSource().phases().collect { phases.add(it) } }
+        val job = backgroundScope.launch { ProcessLifecycleSource { _, _ -> }.phases().collect { phases.add(it) } }
         // The collector registers first, then the main thread runs the install,
         // then the phase reaches the collector.
         testScheduler.runCurrent()
@@ -152,6 +152,29 @@ internal class LeverIntegrationTests {
         // keep working while it runs.
         assertFalse(client[flag])
         client.close()
+    }
+
+    /**
+     * Teardown can beat a posted installation. The observer must then never be
+     * installed at all — an observer added *after* its detach is one nobody is
+     * left to remove (review 0003 pass 3, P1).
+     */
+    @Test
+    fun `detaching before the install post runs never leaves an observer behind`() = runTest {
+        val registry = ProcessLifecycleOwner.get().lifecycle as LifecycleRegistry
+        val before = registry.observerCount
+
+        val source = ProcessLifecycleSource { _, _ -> }
+        val job = backgroundScope.launch { source.phases().collect { } }
+        // The flow body has run and queued its installation; the main looper has
+        // deliberately not been idled, so nothing is installed yet.
+        testScheduler.runCurrent()
+
+        source.detach()
+        Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        assertEquals(before, registry.observerCount, "a queued install outlived detach()")
+        job.cancel()
     }
 
     /**

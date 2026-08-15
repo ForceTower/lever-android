@@ -632,6 +632,46 @@ internal class ClientTests {
         assertEquals(logsAfterClose, harness.sink.all.size, "a read logged past the boundary")
     }
 
+    /**
+     * Refusing new callouts is only half the boundary: a read that passed the
+     * closed check microseconds before `close()` began must still finish its
+     * sink call before `close()` returns (review 0003 pass 3, P1).
+     */
+    @Test
+    fun `close waits for a read diagnostic that already left the lock`() = runTest {
+        val harness = harness()
+        val client = harness.cacheOnlyClient()
+
+        val atTheSink = CountDownLatch(1)
+        val releaseRead = CountDownLatch(1)
+        client.beforeReadLog = {
+            atTheSink.countDown()
+            check(releaseRead.await(10, TimeUnit.SECONDS))
+        }
+
+        // An absent key: the first read of it logs.
+        val reader = Thread { client[retries] }.apply { start() }
+        check(atTheSink.await(10, TimeUnit.SECONDS))
+        assertEquals(0, harness.sink.all.size, "the callout has not reached the sink yet")
+
+        val closed = AtomicInteger()
+        val closer = Thread {
+            client.close()
+            closed.set(1)
+        }
+        closer.start()
+        Thread.sleep(150)
+        assertEquals(0, closed.get(), "close returned while a sink callout was in flight")
+
+        releaseRead.countDown()
+        reader.join(10_000)
+        closer.join(10_000)
+
+        assertEquals(1, closed.get())
+        assertEquals(1, harness.sink.all.size, "the admitted callout never landed")
+        client.beforeReadLog = null
+    }
+
     @Test
     fun `close is idempotent under repetition and concurrency`() = runTest {
         val client = harness().cacheOnlyClient()

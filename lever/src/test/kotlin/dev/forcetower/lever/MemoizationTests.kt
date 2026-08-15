@@ -86,6 +86,33 @@ internal class MemoizationTests {
         client.close()
     }
 
+    /**
+     * Isolation is not enough: two keys colliding on `(name, type)` must also
+     * keep their own memo entries, or every alternating read evicts the other's
+     * and decode-once degrades to decode-always (review 0003 pass 3, P2).
+     */
+    @Test
+    fun `colliding keys keep their own memo entries while alternating`() = runTest {
+        val stringDecodes = AtomicInteger()
+        val intDecodes = AtomicInteger()
+        val strings =
+            LeverKey.json("tags", emptyList(), CountingListSerializer(String.serializer(), stringDecodes))
+        val ints =
+            LeverKey.json("tags", emptyList(), CountingListSerializer(Int.serializer(), intDecodes))
+        assertEquals(strings.typeId, ints.typeId)
+
+        val client = client(mapOf("tags" to wireValue("json", """["1","2"]""")))
+
+        repeat(5) {
+            assertContentEquals(listOf("1", "2"), client[strings])
+            assertContentEquals(listOf(1, 2), client[ints])
+        }
+
+        assertEquals(1, stringDecodes.get(), "the string key was evicted and re-decoded")
+        assertEquals(1, intDecodes.get(), "the int key was evicted and re-decoded")
+        client.close()
+    }
+
     @Test
     fun `custom serializers that share a descriptor name do not share a memo entry`() = runTest {
         val left = LeverKey.json("badge", Left(""), LeftSerializer)
@@ -198,6 +225,25 @@ internal class MemoizationTests {
 
         override fun serialize(encoder: Encoder, value: Right) {
             encoder.encodeString(value.value)
+        }
+    }
+
+    /** A list serializer that counts how often the SDK asked it to decode. */
+    private class CountingListSerializer<T>(
+        element: KSerializer<T>,
+        private val decodes: AtomicInteger,
+    ) : KSerializer<List<T>> {
+        private val delegate = ListSerializer(element)
+
+        override val descriptor: SerialDescriptor get() = delegate.descriptor
+
+        override fun deserialize(decoder: Decoder): List<T> {
+            decodes.incrementAndGet()
+            return delegate.deserialize(decoder)
+        }
+
+        override fun serialize(encoder: Encoder, value: List<T>) {
+            delegate.serialize(encoder, value)
         }
     }
 

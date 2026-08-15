@@ -319,7 +319,7 @@ internal class TestHarness(
             LeverEnvironment(
                 makeTransport = { transport },
                 now = { now },
-                lifecycle = { lifecycle },
+                lifecycle = { _ -> lifecycle },
                 jitter = { ceiling -> ceiling * jitterFraction },
                 runtimeThread = {
                     RuntimeThread(dispatcher) {

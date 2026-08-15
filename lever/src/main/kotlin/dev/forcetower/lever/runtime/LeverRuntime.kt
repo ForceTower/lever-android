@@ -91,7 +91,7 @@ internal class LeverRuntime(
         // (spec 0002 §5).
         if (!configuration.automaticUpdates) return
 
-        val source = environment.lifecycle()
+        val source = environment.lifecycle(configuration)
         lifecycleSource = source
         lifecycleJob = scope.launch { source.phases().collect { handle(it) } }
     }

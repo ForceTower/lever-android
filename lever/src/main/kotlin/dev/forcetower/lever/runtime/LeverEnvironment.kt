@@ -29,7 +29,7 @@ internal class LeverEnvironment(
     val makeTransport: (ValidatedConfiguration) -> LeverTransport,
     /** Wall clock, Unix seconds. */
     val now: () -> Long,
-    val lifecycle: () -> LifecycleSource,
+    val lifecycle: (ValidatedConfiguration) -> LifecycleSource,
     /** Full jitter: a value in `0..ceiling` (spec 0002 §6.2). */
     val jitter: (Double) -> Double,
     val runtimeThread: () -> RuntimeThread,
@@ -39,7 +39,7 @@ internal class LeverEnvironment(
             LeverEnvironment(
                 makeTransport = { OkHttpTransport() },
                 now = { System.currentTimeMillis() / 1000 },
-                lifecycle = { ProcessLifecycleSource() },
+                lifecycle = { configuration -> ProcessLifecycleSource(configuration.logSink) },
                 jitter = { ceiling -> Random.nextDouble(0.0, ceiling) },
                 runtimeThread = { singleThreadRuntime() },
             )

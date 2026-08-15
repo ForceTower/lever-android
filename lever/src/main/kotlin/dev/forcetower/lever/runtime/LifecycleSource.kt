@@ -2,8 +2,11 @@ package dev.forcetower.lever.runtime
 
 import android.os.Handler
 import android.os.Looper
+import dev.forcetower.lever.logging.LeverLogSink
+import dev.forcetower.lever.logging.warn
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
@@ -29,11 +32,13 @@ internal interface LifecycleSource {
     fun phases(): Flow<LifecyclePhase>
 
     /**
-     * Removes the platform observer, and does not return until it is gone.
+     * Removes the platform observer and, on any thread that is not itself
+     * blocking the main thread, does not return until it is gone.
      *
      * Cancelling the collecting coroutine only *queues* the removal, and
      * `close()` promises release rather than a scheduled intention
-     * (spec 0003 §4). Idempotent.
+     * (spec 0003 §4). Idempotent, and safe to call before the observer has
+     * finished installing.
      */
     fun detach() {}
 }
@@ -43,8 +48,15 @@ internal interface LifecycleSource {
  * so the observer is installed and the current state read together there — one
  * post, so no transition can slip between the two (spec 0003 §5).
  */
-internal class ProcessLifecycleSource : LifecycleSource {
+internal class ProcessLifecycleSource(private val sink: LeverLogSink) : LifecycleSource {
     private val installed = AtomicReference<DefaultLifecycleObserver?>(null)
+
+    /**
+     * Set by [detach] and read by the install itself: teardown can win the race
+     * against a posted installation, and an observer added *after* its detach
+     * would never be removed at all.
+     */
+    private val detached = AtomicBoolean(false)
 
     override fun phases(): Flow<LifecyclePhase> =
         callbackFlow {
@@ -60,8 +72,10 @@ internal class ProcessLifecycleSource : LifecycleSource {
                     }
                 }
 
-            installed.set(observer)
             handler.post {
+                // Teardown may already have happened; installing now would leave
+                // an observer nobody is left to remove.
+                if (detached.get()) return@post
                 val lifecycle = ProcessLifecycleOwner.get().lifecycle
                 trySend(
                     if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
@@ -73,6 +87,7 @@ internal class ProcessLifecycleSource : LifecycleSource {
                 // Registering re-delivers the current state to the new observer,
                 // which `distinctUntilChanged` collapses into the read above.
                 lifecycle.addObserver(observer)
+                installed.set(observer)
             }
 
             awaitClose { detach() }
@@ -80,12 +95,20 @@ internal class ProcessLifecycleSource : LifecycleSource {
             .distinctUntilChanged()
 
     override fun detach() {
-        val observer = installed.getAndSet(null) ?: return
-        val remove = Runnable { ProcessLifecycleOwner.get().lifecycle.removeObserver(observer) }
+        // Marking first is what closes the race: an installation still sitting in
+        // the main thread's queue sees this and skips.
+        if (!detached.compareAndSet(false, true)) return
+        val remove =
+            Runnable {
+                installed.getAndSet(null)?.let {
+                    ProcessLifecycleOwner.get().lifecycle.removeObserver(it)
+                }
+            }
 
         // Lifecycle APIs are main-thread only. A caller already on the main
         // thread removes inline — posting there and waiting would deadlock on
-        // itself — and anyone else waits for the post to run.
+        // itself — and anyone else waits for the post to run. Either way the
+        // removal is ordered behind the installation it has to undo.
         if (Looper.myLooper() == Looper.getMainLooper()) {
             remove.run()
             return
@@ -95,15 +118,16 @@ internal class ProcessLifecycleSource : LifecycleSource {
             remove.run()
             removed.countDown()
         }
-        removed.await(DETACH_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        if (!removed.await(DETACH_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            // Only reachable when the main thread is blocked by something else:
+            // removal stays queued and runs when it frees up, and until then the
+            // observer can only feed a flow that is already cancelled. Waiting
+            // longer would turn someone else's stall into this client's hang.
+            sink.warn("lifecycle observer removal is waiting on a blocked main thread")
+        }
     }
 
     private companion object {
-        /**
-         * A blocked main thread must not turn teardown into a hang; the observer
-         * is then removed by the post whenever the main thread frees up, and it
-         * can only feed an already-cancelled flow in the meantime.
-         */
         const val DETACH_TIMEOUT_SECONDS = 2L
     }
 }
