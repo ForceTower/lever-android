@@ -1,0 +1,53 @@
+name: publish
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      dryRun:
+        description: "Build, sign, and upload a deployment without releasing it"
+        type: boolean
+        default: true
+
+# Central releases are immutable. The tag path publishes; the manual path
+# uploads a user-managed deployment that a human validates and then releases or
+# drops from the Portal (plan 0003 M1).
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Check the tag against the published version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="$(sed -n 's/^VERSION_NAME=//p' gradle.properties)"
+          if [ "$tag" != "$version" ]; then
+            echo "tag $tag does not match VERSION_NAME $version" >&2
+            exit 1
+          fi
+          if [ ! -f "lever/api/$version.api" ]; then
+            echo "no frozen abi for $version — run ./gradlew :lever:apiFreeze" >&2
+            exit 1
+          fi
+
+      - run: ./gradlew build --stacktrace
+
+      - name: Publish to Maven Central
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: ./gradlew publishToMavenCentral --no-configuration-cache --stacktrace

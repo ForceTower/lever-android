@@ -1,0 +1,88 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: jvm suites, lint, and the abi check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The contract fixtures live in the lever monorepo, pinned by SHA.
+      # Bumping .contract-fixtures-sha is the contract-sync act (spec 0003 §1).
+      - name: Check out the pinned contract fixtures
+        uses: actions/checkout@v5
+        with:
+          repository: ForceTower/lever
+          path: .contract-fixtures-repo
+          fetch-depth: 0
+
+      - name: Pin the fixtures to the recorded sha
+        run: |
+          set -euo pipefail
+          sha="$(tr -d '[:space:]' < .contract-fixtures-sha)"
+          git -C .contract-fixtures-repo checkout --quiet "$sha"
+          dir=".contract-fixtures-repo/packages/contract-fixtures/fixtures/http"
+          count="$(find "$dir" -name '*.json' | wc -l | tr -d ' ')"
+          if [ "$count" -lt 6 ]; then
+            echo "expected at least 6 http fixtures, found $count" >&2
+            exit 1
+          fi
+          echo "LEVER_CONTRACT_FIXTURES=$GITHUB_WORKSPACE/$dir" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # `build` covers the unit suites, Android lint, the ABI check against the
+      # committed dump, and the consumer fixture's minified release build.
+      - run: ./gradlew build --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: reports
+          path: |
+            **/build/reports/**
+            **/build/test-results/**
+
+  instrumented:
+    name: instrumented smoke (managed device)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # The managed device needs hardware acceleration on the runner.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - run: ./gradlew :lever:smokeApi30DebugAndroidTest --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: instrumented-reports
+          path: lever/build/reports/**
