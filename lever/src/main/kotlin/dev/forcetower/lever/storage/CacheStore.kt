@@ -9,6 +9,8 @@ import java.io.File
 import java.io.IOException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
+// Explicitly the nio one: kotlin.io ships a same-named exception by default import.
+import java.nio.file.NoSuchFileException
 import java.nio.file.StandardCopyOption
 import java.util.Locale
 import java.util.UUID
@@ -64,34 +66,89 @@ internal class CacheStore(
     private fun createOrLoadIdentity(): String {
         createDirectory()
 
-        readIdentity()?.let { return it }
+        val existing = readIdentity()
+        when (existing) {
+            is IdentityRead.Found -> return existing.clientId
+            IdentityRead.OutOfReach -> {
+                // Credential-encrypted storage before the first unlock, most of
+                // all: the file is there and will be readable again later.
+                // Minting a replacement is wrong and *persisting* one would
+                // destroy the installation's real identity, so this id is
+                // deliberately volatile — it lasts for this process and touches
+                // nothing on disk.
+                sink.warn("identity file could not be read — using a volatile client id")
+                return UUID.randomUUID().toString().lowercase(Locale.ROOT)
+            }
+            IdentityRead.Absent, IdentityRead.Unusable -> Unit
+        }
 
         val generated = UUID.randomUUID().toString().lowercase(Locale.ROOT)
         val payload = leverJson.encodeToString(IdentityFile(SCHEMA_VERSION, generated))
 
+        // Bytes that were read and are not an identity are not someone else's
+        // identity either, so there is nothing to lose by replacing them.
+        if (existing == IdentityRead.Unusable) return overwriteIdentity(generated)
+
         return when (publishExclusively(payload)) {
             Publication.CREATED -> generated
-            // Someone else won; their identity is the one on disk.
-            Publication.ALREADY_EXISTS -> readIdentity() ?: overwriteIdentity(generated)
+            // Someone else won between the read and the rename; their identity
+            // is the one on disk. Overwriting is safe only when the re-read
+            // proves the file unusable — never when it merely could not be read.
+            Publication.ALREADY_EXISTS ->
+                when (val reread = readIdentity()) {
+                    is IdentityRead.Found -> reread.clientId
+                    IdentityRead.Unusable -> overwriteIdentity(generated)
+                    IdentityRead.Absent, IdentityRead.OutOfReach -> generated
+                }
             // Nothing was published, so a readable file can only be someone
             // else's — preferring it keeps a failed write from minting a second
             // identity for an installation that already has one.
-            Publication.FAILED -> readIdentity() ?: generated
+            Publication.FAILED -> (readIdentity() as? IdentityRead.Found)?.clientId ?: generated
         }
     }
 
-    private fun readIdentity(): String? {
-        val raw = readText(identityFile) ?: return null
+    /**
+     * Why absence and unreadability are not the same answer: collapsing them
+     * makes an unreadable file look like a first run, and the first run path
+     * both mints a new identity *and* writes it over the one already there.
+     */
+    private sealed interface IdentityRead {
+        data class Found(val clientId: String) : IdentityRead
+
+        /** No file — a genuine first run. */
+        data object Absent : IdentityRead
+
+        /** A file that cannot be read *right now*. Never a reason to write. */
+        data object OutOfReach : IdentityRead
+
+        /** Read, but not an identity: wrong schema, bad JSON, not a uuid. */
+        data object Unusable : IdentityRead
+    }
+
+    private fun readIdentity(): IdentityRead {
+        // Not `readText`: it answers `null` for a missing file and for one it
+        // was refused, and `File.isFile` is itself false when the stat is
+        // denied. Only the nio exceptions separate the two.
+        val raw =
+            try {
+                String(Files.readAllBytes(path(identityFile)), Charsets.UTF_8)
+            } catch (_: NoSuchFileException) {
+                return IdentityRead.Absent
+            } catch (_: IOException) {
+                return IdentityRead.OutOfReach
+            } catch (_: SecurityException) {
+                return IdentityRead.OutOfReach
+            }
         val file =
             try {
                 leverJson.decodeFromString<IdentityFile>(raw)
             } catch (_: RuntimeException) {
                 sink.warn("identity file is unreadable — regenerating the client id")
-                return null
+                return IdentityRead.Unusable
             }
         if (file.schemaVersion != SCHEMA_VERSION) {
             sink.warn("identity file is unreadable — regenerating the client id")
-            return null
+            return IdentityRead.Unusable
         }
         // Spec 0002 §7 defines the persisted identity as a lowercase UUID, and
         // spec 0001 §6.2 caps clientId at 64 chars, so anything unparseable is
@@ -99,7 +156,7 @@ internal class CacheStore(
         val canonical = canonicalUuid(file.clientId)
         if (canonical == null) {
             sink.warn("client id is not a uuid — regenerating")
-            return null
+            return IdentityRead.Unusable
         }
         if (canonical != file.clientId) {
             // Same installation, wrong spelling. Rewriting beats regenerating:
@@ -107,9 +164,9 @@ internal class CacheStore(
             // cache directory that each regenerated on the other's casing would
             // reshuffle every percentage rollout forever (spec 0002 §12.1).
             sink.warn("client id was not canonical — rewriting it lowercase")
-            return overwriteIdentity(canonical)
+            return IdentityRead.Found(overwriteIdentity(canonical))
         }
-        return file.clientId
+        return IdentityRead.Found(file.clientId)
     }
 
     private fun canonicalUuid(raw: String): String? {

@@ -10,10 +10,13 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import org.junit.Assume.assumeTrue
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -178,6 +181,40 @@ internal class StorageTests {
         File(directory, "identity.json").writeText("{oops")
         assertNotNull(store().loadOrCreateClientId())
         assertTrue(sink.contains(LeverLogLevel.WARN, "identity file is unreadable"))
+        // Replacing bytes that are not an identity is the one safe overwrite,
+        // and the replacement has to survive the next launch.
+        val regenerated = store().loadOrCreateClientId()
+        assertEquals(regenerated, store().loadOrCreateClientId())
+    }
+
+    /**
+     * A file that is present but refused is not a first run. Reading it as one
+     * mints a new identity *and* writes it over the real one, which loses the
+     * rollout bucketing key permanently — so an unreadable file must leave the
+     * disk untouched (spec 0002 §12.1).
+     */
+    @Test
+    fun `an identity that cannot be read is never overwritten`() {
+        val original = store().loadOrCreateClientId()
+        val file = File(directory, "identity.json")
+        val before = file.readBytes()
+
+        assertTrue(file.setReadable(false, false), "the filesystem ignored the permission change")
+        try {
+            // Root reads it anyway, and then there is nothing to prove.
+            assumeTrue(runCatching { file.readBytes() }.isFailure)
+
+            val volatileId = store().loadOrCreateClientId()
+            assertEquals(volatileId, UUID.fromString(volatileId).toString())
+            assertNotEquals(original, volatileId)
+            assertTrue(sink.contains(LeverLogLevel.WARN, "identity file could not be read"))
+        } finally {
+            file.setReadable(true, false)
+        }
+
+        assertContentEquals(before, file.readBytes())
+        // The installation's real identity comes back the moment it is readable.
+        assertEquals(original, store().loadOrCreateClientId())
     }
 
     /**
