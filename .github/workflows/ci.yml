@@ -38,6 +38,36 @@ jobs:
             **/build/reports/**
             **/build/test-results/**
 
+  # Every commit on main is resolvable as <next version>-SNAPSHOT, so the
+  # flagship can consume the SDK between releases instead of waiting for a tag.
+  # Gated on `build` only: the instrumented smoke is a separate job, so a
+  # snapshot can publish while a device failure is still being chased.
+  snapshot:
+    name: publish the snapshot
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # No -PRELEASE: the build appends -SNAPSHOT, and the plugin routes a
+      # snapshot to Central's snapshot repository rather than a deployment.
+      - name: Publish the snapshot
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: ./gradlew publishToMavenCentral --no-configuration-cache --stacktrace
+
   instrumented:
     name: instrumented smoke (managed device)
     runs-on: ubuntu-latest

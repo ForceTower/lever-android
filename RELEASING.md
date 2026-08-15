@@ -59,6 +59,14 @@ to strip before a release and none to put back afterwards — the one edit per
 cycle is bumping to the next version, and forgetting it cannot publish a bare
 version by accident.
 
+Every commit on `main` publishes `<VERSION_NAME>-SNAPSHOT` to Central's snapshot
+repository once the jvm suites pass, so consumers can track the SDK between
+releases:
+
+```kotlin
+repositories { maven("https://central.sonatype.com/repository/maven-snapshots/") }
+```
+
 ## Cutting a release
 
 1. Land everything, with `./gradlew build` green (unit suites, lint, the ABI
