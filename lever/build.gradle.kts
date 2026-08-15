@@ -258,7 +258,10 @@ mavenPublishing {
         url = "https://github.com/ForceTower/lever-android"
         licenses {
             license {
-                name = "MIT License"
+                // The bare SPDX identifier, not "MIT License": consumers running a
+                // license audit (Licensee and friends) match on the id, and a
+                // prose name forces them to allow-list this URL by hand instead.
+                name = "MIT"
                 url = "https://github.com/ForceTower/lever-android/blob/main/LICENSE"
             }
         }

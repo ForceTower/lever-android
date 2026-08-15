@@ -200,7 +200,21 @@ public class LeverClient internal constructor(
      * resolve to [LeverKey.defaultValue] and log (spec 0003 §2.3). Values are
      * stable until the next [activate].
      */
-    public fun <V> value(key: LeverKey<V>): V {
+    public fun <V> value(key: LeverKey<V>): V = read(key) ?: key.defaultValue
+
+    /**
+     * The same read, reporting absence instead of absorbing it: `null` means
+     * this environment has no value [key] can serve — not published, or present
+     * but unreadable as `V` (spec 0003 §2.3).
+     *
+     * It exists for one caller: a composite that layers lever over another
+     * config source. [value] commits to the code default the moment lever is
+     * silent, which would shadow every lower layer; [lookup] lets the caller
+     * fall through and keep the code default as the floor under *all* of them.
+     */
+    public fun <V> lookup(key: LeverKey<V>): V? = read(key)
+
+    private fun <V> read(key: LeverKey<V>): V? {
         // The fast path a hot read site takes: one lock-protected map lookup.
         if (!key.memoizes) return resolve(key, memoize = false)
 
@@ -231,7 +245,7 @@ public class LeverClient internal constructor(
     /** The memoized value for this exact key, or `null` when there is none. */
     private fun <V> memoEntry(key: LeverKey<V>): MemoEntry? = lock.withLock { state.memo[key] }
 
-    private fun <V> resolve(key: LeverKey<V>, memoize: Boolean): V {
+    private fun <V> resolve(key: LeverKey<V>, memoize: Boolean): V? {
         var raw: WireValue? = null
         var version: Int? = null
         var generation = 0L
@@ -266,14 +280,14 @@ public class LeverClient internal constructor(
                 logOnce(LogKey(key.name, version, null), LeverLogLevel.DEBUG) {
                     "key absent key=${key.name}"
                 }
-                key.defaultValue
+                null
             }
 
             ReadOutcome.Mismatch -> {
                 logOnce(LogKey(key.name, version, key.typeId), LeverLogLevel.WARN) {
                     "type mismatch key=${key.name} wire=${present?.type ?: "none"} as=${key.typeId}"
                 }
-                key.defaultValue
+                null
             }
         }
     }

@@ -221,6 +221,48 @@ internal class ClientTests {
     }
 
     @Test
+    fun `lookup reports absence and mismatch instead of serving the default`() = runTest {
+        val harness = harness()
+        val client = harness.cacheOnlyClient()
+
+        assertNull(client.lookup(flag))
+        assertFalse(client[flag])
+
+        // A published `false` is a value, not an absence — the distinction the
+        // default-serving read cannot express.
+        client.stage(representation(1, mapOf("flag" to wireBool(false))))
+        client.activate()
+        assertEquals(false, client.lookup(flag))
+
+        client.stage(representation(2, mapOf("flag" to wireString("nope"))))
+        client.activate()
+        assertNull(client.lookup(flag))
+        assertEquals(1, harness.sink.count(LeverLogLevel.WARN, "type mismatch key=flag"))
+        client.close()
+    }
+
+    @Test
+    fun `lookup resolves json keys through the same memo`() = runTest {
+        val client = harness().cacheOnlyClient()
+        val paywall = LeverKey.json("paywall", Paywall("fallback", "none"))
+
+        assertNull(client.lookup(paywall))
+
+        client.stage(
+            representation(
+                1,
+                mapOf("paywall" to wireValue("json", """{"headline":"a","cta":"b"}""")),
+            )
+        )
+        client.activate()
+        assertEquals(Paywall("a", "b"), client.lookup(paywall))
+        // …and again, now that it is memoized, through both read surfaces.
+        assertEquals(Paywall("a", "b"), client.lookup(paywall))
+        assertEquals(Paywall("a", "b"), client[paywall])
+        client.close()
+    }
+
+    @Test
     fun `a sink that reads while handling a message never deadlocks`() = runTest {
         val harness = harness()
         val client = harness.cacheOnlyClient()

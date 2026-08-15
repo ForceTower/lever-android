@@ -112,6 +112,22 @@ falls back to the default.
 > decode `9007199254740993` — but do not author values beyond that bound: they
 > may already have been rounded before the SDK ever sees them.
 
+### Layering lever over another source
+
+`lookup` is the same read, reporting absence instead of absorbing it:
+
+```kotlin
+lever.lookup(Flags.enableEnrollment)   // Boolean? — null when lever is silent
+```
+
+`null` means this environment has nothing the key can serve: not published, or
+present but unreadable as the declared type. It exists for exactly one caller —
+a composite that puts lever in front of another config source. `get`/`value`
+commit to the code default the moment lever is silent, which would shadow every
+layer beneath it; `lookup` lets the caller fall through and keep the code
+default as the floor under *all* of them. Everywhere else, read the
+non-optional way.
+
 ## Fetch and activate
 
 ```kotlin

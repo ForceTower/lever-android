@@ -15,6 +15,7 @@ public final class dev/forcetower/lever/LeverClient {
 	public final fun get (Ldev/forcetower/lever/LeverKey;)Ljava/lang/Object;
 	public final fun getActivatedVersion ()Ljava/lang/Integer;
 	public final fun getUpdates ()Lkotlinx/coroutines/flow/Flow;
+	public final fun lookup (Ldev/forcetower/lever/LeverKey;)Ljava/lang/Object;
 	public final fun value (Ldev/forcetower/lever/LeverKey;)Ljava/lang/Object;
 }
 
