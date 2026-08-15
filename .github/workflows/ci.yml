@@ -59,6 +59,20 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      # AGP installs the managed device's system image itself, but refuses to
+      # until the licences are on disk, and the runner ships the SDK without the
+      # system-image one accepted. No `pipefail` here on purpose: `yes` dies of
+      # SIGPIPE when sdkmanager stops reading, which would fail the step.
+      - name: Accept the Android SDK licences
+        run: |
+          set -eu
+          sdkmanager="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | head -1)"
+          if [ -z "$sdkmanager" ]; then
+            echo "no sdkmanager under $ANDROID_HOME/cmdline-tools" >&2
+            exit 1
+          fi
+          yes | "$sdkmanager" --licenses > /dev/null
+
       - run: ./gradlew :lever:smokeApi30DebugAndroidTest --stacktrace
 
       - uses: actions/upload-artifact@v5
