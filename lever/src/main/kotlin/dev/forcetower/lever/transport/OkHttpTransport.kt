@@ -2,6 +2,7 @@ package dev.forcetower.lever.transport
 
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.Dispatchers
@@ -89,11 +90,23 @@ internal class OkHttpTransport : LeverTransport {
                 )
             }
 
+        val reading = AtomicBoolean(false)
         return HttpStream(
             status = response.code,
             headers = response.leverHeaders(),
-            chunks = response.chunks(call),
-        )
+            chunks = response.chunks(call, reading),
+        ) {
+            // A round that was never read — a 401, a 503, a wrong media type —
+            // is released by closing its body, which hands the connection back
+            // to the pool. Cancelling instead would tear the socket down and
+            // make every reconnect pay for a new one.
+            if (reading.get()) call.cancel()
+            try {
+                response.close()
+            } catch (_: IllegalStateException) {
+                // Already consumed by the chunk flow's `use`.
+            }
+        }
     }
 
     override fun close() {
@@ -109,7 +122,8 @@ internal class OkHttpTransport : LeverTransport {
      * grow this buffer without limit — below the parser, where the 1 MiB frame
      * bound cannot see it (spec 0002 §12.1).
      */
-    private fun Response.chunks(call: Call): Flow<ByteArray> = callbackFlow {
+    private fun Response.chunks(call: Call, reading: AtomicBoolean): Flow<ByteArray> = callbackFlow {
+        reading.set(true)
         val reader =
             launch(Dispatchers.IO) {
                 try {

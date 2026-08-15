@@ -154,6 +154,30 @@ internal class LeverIntegrationTests {
         client.close()
     }
 
+    /**
+     * `close()` promises release, not a queued intention: the observer is gone
+     * when it returns, with no looper idling afterwards to help it along
+     * (review 0003 pass 3, P3-F3).
+     */
+    @Test
+    fun `close removes the live lifecycle observer before it returns`() = runTest {
+        val registry = ProcessLifecycleOwner.get().lifecycle as LifecycleRegistry
+        val before = registry.observerCount
+
+        val client = LeverClient(context, configuration(automaticUpdates = true))
+        // The live runtime subscribes from its own thread and installs the
+        // observer through the main looper, so wait for that to land.
+        val deadline = System.nanoTime() + 5_000_000_000
+        while (registry.observerCount == before && System.nanoTime() < deadline) {
+            Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            Thread.sleep(10)
+        }
+        assertEquals(before + 1, registry.observerCount, "the observer never installed")
+
+        client.close()
+        assertEquals(before, registry.observerCount, "the observer outlived close()")
+    }
+
     private companion object {
         /** Port 1 is reserved and closed: connections are refused immediately. */
         const val UNREACHABLE = "http://127.0.0.1:1"

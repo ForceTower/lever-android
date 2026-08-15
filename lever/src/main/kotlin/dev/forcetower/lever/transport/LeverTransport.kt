@@ -1,5 +1,6 @@
 package dev.forcetower.lever.transport
 
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.Flow
 
 internal data class Header(val name: String, val value: String)
@@ -41,12 +42,25 @@ internal class HttpResponse(
 /**
  * A validated, still-open stream. [chunks] yields whatever arrives; the SSE
  * parser is written to be indifferent to chunk boundaries (spec 0002 §6.2).
+ *
+ * The response body is live from the moment the headers arrive, so ownership is
+ * explicit: a round that never collects [chunks] — a 401, a 503, a wrong media
+ * type — must still [close] the stream, or the connection stays checked out and
+ * a reconnect cycle accumulates them.
  */
 internal class HttpStream(
     val status: Int?,
     val headers: HttpHeaders = HttpHeaders(),
     val chunks: Flow<ByteArray>,
-)
+    private val onClose: () -> Unit = {},
+) {
+    private val closed = AtomicBoolean(false)
+
+    /** Idempotent: releasing a rejected round is as ordinary as reaching EOF. */
+    fun close() {
+        if (closed.compareAndSet(false, true)) onClose()
+    }
+}
 
 /**
  * Everything the runtime needs from the network, and the seam tests replace

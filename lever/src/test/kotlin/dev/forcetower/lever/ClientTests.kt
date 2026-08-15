@@ -567,6 +567,71 @@ internal class ClientTests {
         client.close()
     }
 
+    /**
+     * "Repeated or concurrent `close()` is a no-op after the first" cannot mean
+     * "returns before the close is a fact": a second caller that raced past the
+     * barrier would observe a closed client while the first caller's admitted
+     * commit was still persisting, logging, and delivering
+     * (review 0003 pass 3, P3-F3).
+     */
+    @Test
+    fun `a concurrent close waits for the same boundary as the first`() = runTest {
+        val harness = harness()
+        val client = harness.cacheOnlyClient()
+
+        val pastTheLock = CountDownLatch(1)
+        val releaseCommit = CountDownLatch(1)
+        client.afterStateLock = {
+            pastTheLock.countDown()
+            check(releaseCommit.await(10, TimeUnit.SECONDS))
+        }
+
+        client.stage(representation(3, mapOf("flag" to wireBool(true))))
+        val activation = Thread { client.activate() }.apply { start() }
+        check(pastTheLock.await(10, TimeUnit.SECONDS))
+
+        val returned = AtomicInteger()
+        val closers =
+            (1..2).map {
+                Thread {
+                    client.close()
+                    returned.incrementAndGet()
+                }
+            }
+        closers.forEach { it.start() }
+        Thread.sleep(150)
+        assertEquals(0, returned.get(), "a closer returned while the commit was mid-flight")
+
+        releaseCommit.countDown()
+        activation.join(10_000)
+        closers.forEach { it.join(10_000) }
+
+        assertEquals(2, returned.get())
+        // The teardown itself happened exactly once, before either return.
+        assertEquals(1, harness.runtimeShutdowns)
+        assertTrue(harness.sink.contains(LeverLogLevel.INFO, "activated version=3"))
+        assertEquals(3, harness.cacheOnlyClient().also { it.close() }.activatedVersion)
+        client.afterStateLock = null
+    }
+
+    @Test
+    fun `reads after close serve values but start no new sink callback`() = runTest {
+        val harness = harness()
+        val client = harness.cacheOnlyClient()
+        client.stage(representation(1, mapOf("flag" to wireString("nope"))))
+        client.activate()
+        client.close()
+
+        val logsAfterClose = harness.sink.all.size
+        // A first-ever absent read and a first-ever mismatch read: both would
+        // log on an open client.
+        assertEquals(1, client[retries])
+        assertFalse(client[flag])
+        assertEquals(0, client[LeverKey.int("never-read", default = 0)])
+
+        assertEquals(logsAfterClose, harness.sink.all.size, "a read logged past the boundary")
+    }
+
     @Test
     fun `close is idempotent under repetition and concurrency`() = runTest {
         val client = harness().cacheOnlyClient()
@@ -582,6 +647,22 @@ internal class ClientTests {
         // Reads survive forever: a closed client degrades to a static one.
         assertTrue(client[flag])
         assertEquals(1, client.activatedVersion)
+    }
+
+    @Test
+    fun `close releases the lifecycle observer, the transport, and the thread once`() = runTest {
+        val harness = harness()
+        val client = harness.client(harness.configuration())
+        settle()
+        assertEquals(1, harness.lifecycle.subscriptions)
+
+        val closers = (1..4).map { Thread { client.close() } }
+        closers.forEach { it.start() }
+        closers.forEach { it.join(10_000) }
+
+        assertEquals(1, harness.lifecycle.detaches, "the observer was not removed exactly once")
+        assertEquals(1, harness.runtimeShutdowns)
+        assertTrue(harness.transport.isClosed)
     }
 
     @Test

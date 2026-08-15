@@ -68,6 +68,7 @@ internal class LeverRuntime(
      * (spec 0002 §5.3).
      */
     private var pendingNudge: Int? = null
+    private var lifecycleSource: LifecycleSource? = null
     private var foregrounded = false
     private var sawInitialPhase = false
     /** A 401 on the stream stops reconnecting until the next foreground. */
@@ -91,13 +92,23 @@ internal class LeverRuntime(
         if (!configuration.automaticUpdates) return
 
         val source = environment.lifecycle()
+        lifecycleSource = source
         lifecycleJob = scope.launch { source.phases().collect { handle(it) } }
     }
 
     fun close() {
         closed = true
+        // Before cancelling, not as a consequence of it: cancellation only
+        // queues the collector's teardown, and the observer must be gone when
+        // close() returns (spec 0003 §4).
+        lifecycleSource?.detach()
+        lifecycleSource = null
         scope.cancel()
+        // Cancelling the calls in flight first means the thread has nothing left
+        // to wait on when it drains.
         transport.close()
+        // Runs whatever cancellation left queued, then terminates the thread —
+        // release, not just a cancelled job.
         runtimeThread.shutdown()
     }
 
@@ -392,6 +403,17 @@ internal class LeverRuntime(
                 return Round.Failed(null)
             }
 
+        // The stream owns a live response body from the headers onward, so every
+        // branch below releases it — a rejected round leaks a connection
+        // otherwise (spec 0003 §6.1's dedicated client is not a substitute).
+        try {
+            return round(stream)
+        } finally {
+            stream.close()
+        }
+    }
+
+    private suspend fun round(stream: HttpStream): Round {
         // "Open" means validated: anything else never reaches the parser, so a
         // proxy's 200 HTML error page fails fast instead of sitting in the byte
         // loop until the watchdog fires (spec 0002 §6.2).
@@ -415,10 +437,9 @@ internal class LeverRuntime(
         return if (pump(stream)) Round.Active else Round.Failed(null)
     }
 
-    /** Returns whether any bytes arrived, which is what resets the backoff. */
+    /** Returns whether a **frame** completed, which is what resets the backoff. */
     private suspend fun pump(stream: HttpStream): Boolean {
         val parser = ServerSentEventParser()
-        var sawActivity = false
 
         coroutineScope {
             val chunks = Channel<ByteArray>(Channel.UNLIMITED)
@@ -448,7 +469,6 @@ internal class LeverRuntime(
                         break
                     }
                     val chunk = received.getOrNull() ?: break
-                    sawActivity = true
 
                     val events =
                         try {
@@ -469,7 +489,7 @@ internal class LeverRuntime(
             }
         }
 
-        return sawActivity
+        return parser.completedFrames > 0
     }
 
     companion object {

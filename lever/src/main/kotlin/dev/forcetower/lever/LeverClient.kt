@@ -9,6 +9,8 @@ import dev.forcetower.lever.runtime.LeverRuntime
 import dev.forcetower.lever.storage.CacheStore
 import dev.forcetower.lever.storage.CachedSnapshot
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlinx.coroutines.channels.Channel
@@ -70,6 +72,13 @@ public class LeverClient internal constructor(
     private val cache = CacheStore(config.cacheDirectory, config.cacheKeyHash, config.logSink)
     private val lock = ReentrantLock()
     private val state = State()
+
+    /**
+     * One lock per memoizing key, so a slow serializer blocks only readers of
+     * that key. Bounded by the number of distinct `(name, type)` pairs read,
+     * exactly like the memo itself.
+     */
+    private val decodeGates = ConcurrentHashMap<MemoKey, ReentrantLock>()
     private val gate = CommitGate()
     private val now: () -> Long = environment.now
     private val runtime = LeverRuntime(config, environment)
@@ -113,7 +122,7 @@ public class LeverClient internal constructor(
          * cannot install a stale memo entry.
          */
         var generation: Long = 0
-        val memo = mutableMapOf<MemoKey, Any?>()
+        val memo = mutableMapOf<MemoKey, MemoEntry>()
         val logged = mutableSetOf<LogKey>()
 
         /**
@@ -124,10 +133,30 @@ public class LeverClient internal constructor(
         var commitSequence: Long = 0
         val collectors = mutableMapOf<Long, SendChannel<LeverUpdate>>()
         var nextCollectorId: Long = 0
-        var closed = false
+
+        /**
+         * `CLOSING` already refuses new work; it becomes `CLOSED` only once the
+         * teardown is a fact, so a concurrent closer can wait for the same
+         * boundary instead of racing past it.
+         */
+        var closeState = CloseState.OPEN
+        var closeBarrier: CountDownLatch? = null
+
+        val isClosed: Boolean get() = closeState != CloseState.OPEN
     }
 
+    private enum class CloseState { OPEN, CLOSING, CLOSED }
+
     private data class MemoKey(val name: String, val typeId: String)
+
+    /**
+     * A decoded `json` value and the key instance that decoded it. The token is
+     * checked by identity on every hit: [MemoKey] can collide (two keys over one
+     * wire name whose serializers share a descriptor name), and serving one
+     * key's object to another would throw `ClassCastException` in the caller
+     * under erasure — a read that promises never to throw.
+     */
+    private class MemoEntry(val token: Any, val value: Any?)
 
     /**
      * `typeId` is `null` for absence, which dedupes per `(key, version)`; a
@@ -150,34 +179,58 @@ public class LeverClient internal constructor(
      * stable until the next [activate].
      */
     public fun <V> value(key: LeverKey<V>): V {
+        // The fast path a hot read site takes: one lock-protected map lookup.
+        if (!key.memoizes) return resolve(key, memoKey = null)
+
         val memoKey = MemoKey(key.name, key.typeId)
+        memoEntry(memoKey, key)?.let {
+            @Suppress("UNCHECKED_CAST")
+            return it.value as V
+        }
+
+        // Exactly one reader runs a consumer's serializer for this key; the rest
+        // wait for its result rather than decoding again. Neither the state lock
+        // nor the commit gate is held here, so the decoder is free to be slow —
+        // and free to read other flags (spec 0002 §4.1).
+        return decodeGates.computeIfAbsent(memoKey) { ReentrantLock() }.withLock {
+            val entry = memoEntry(memoKey, key)
+            if (entry != null) {
+                @Suppress("UNCHECKED_CAST")
+                entry.value as V
+            } else {
+                resolve(key, memoKey)
+            }
+        }
+    }
+
+    /** The memoized value for this exact key, or `null` when there is none. */
+    private fun <V> memoEntry(memoKey: MemoKey, key: LeverKey<V>): MemoEntry? =
+        lock.withLock { state.memo[memoKey] }?.takeIf { it.token === key }
+
+    private fun <V> resolve(key: LeverKey<V>, memoKey: MemoKey?): V {
         var raw: WireValue? = null
         var version: Int? = null
         var generation = 0L
-        var memoized: Any? = null
-
         lock.withLock {
             val activated = state.activated
             raw = activated?.values?.get(key.name)
             version = activated?.version
             generation = state.generation
-            if (key.memoizes) memoized = state.memo[memoKey]
         }
 
         // Everything below runs outside the lock: a `json` decoder is arbitrary
         // consumer code and the sink is the host app's (spec 0002 §4.1).
-        if (memoized != null) {
-            @Suppress("UNCHECKED_CAST")
-            return memoized as V
-        }
-
         val present = raw
         val values = if (present == null) emptyMap() else mapOf(key.name to present)
         return when (val outcome = resolveRead(key, values)) {
             is ReadOutcome.Resolved -> {
-                if (key.memoizes) {
+                if (memoKey != null) {
                     lock.withLock {
-                        if (state.generation == generation) state.memo[memoKey] = outcome.value
+                        // A decode that raced an activation must not install a
+                        // stale memo entry into the newer representation.
+                        if (state.generation == generation) {
+                            state.memo[memoKey] = MemoEntry(key, outcome.value)
+                        }
                     }
                 }
                 outcome.value
@@ -221,7 +274,7 @@ public class LeverClient internal constructor(
             val channel = Channel<LeverUpdate>(Channel.UNLIMITED)
             val id =
                 lock.withLock {
-                    if (state.closed) return@withLock null
+                    if (state.isClosed) return@withLock null
                     val id = ++state.nextCollectorId
                     state.collectors[id] = channel
                     id
@@ -269,7 +322,7 @@ public class LeverClient internal constructor(
 
         val commit =
             lock.withLock {
-                if (state.closed) return false
+                if (state.isClosed) return false
                 val staged = state.staged ?: return false
 
                 val before = state.activated?.values ?: emptyMap()
@@ -330,28 +383,53 @@ public class LeverClient internal constructor(
                 "Construct a LeverClient directly if you need one you can close."
         }
 
+        // Decide once, under the lock; wait outside it, or the joiner would
+        // hold the very lock the closer needs to finish.
+        var joining: CountDownLatch? = null
         val admitted =
             lock.withLock {
-                if (state.closed) return
-                state.closed = true
+                if (state.isClosed) {
+                    joining = state.closeBarrier
+                    return@withLock -1L
+                }
+                state.closeState = CloseState.CLOSING
+                state.closeBarrier = CountDownLatch(1)
                 // Everything allocated before the mark is already admitted; no
                 // ticket can be allocated after it.
                 state.commitSequence
             }
 
-        gate.awaitDrain(admitted)
+        // A concurrent caller joins the same boundary. Returning early would let
+        // it observe "closed" while the first caller's admitted commit was still
+        // logging and delivering — the one thing close() promises cannot happen
+        // after it returns.
+        joining?.let {
+            it.await()
+            return
+        }
+        if (admitted < 0) return
 
-        val collectors =
-            lock.withLock {
-                val open = state.collectors.values.toList()
-                state.collectors.clear()
-                open
+        try {
+            gate.awaitDrain(admitted)
+
+            val collectors =
+                lock.withLock {
+                    val open = state.collectors.values.toList()
+                    state.collectors.clear()
+                    open
+                }
+            // Whatever was enqueued before the boundary still drains to a live
+            // collector; nothing new is ever enqueued after it.
+            collectors.forEach { it.close() }
+
+            runtime.close()
+        } finally {
+            val barrier = lock.withLock {
+                state.closeState = CloseState.CLOSED
+                state.closeBarrier
             }
-        // Whatever was enqueued before the boundary still drains to a live
-        // collector; nothing new is ever enqueued after it.
-        collectors.forEach { it.close() }
-
-        runtime.close()
+            barrier?.countDown()
+        }
     }
 
     private class Commit(
@@ -410,7 +488,7 @@ public class LeverClient internal constructor(
         }
 
     internal fun stage(representation: Representation) {
-        lock.withLock { if (!state.closed) state.staged = representation }
+        lock.withLock { if (!state.isClosed) state.staged = representation }
     }
 
     /**
@@ -423,7 +501,7 @@ public class LeverClient internal constructor(
     internal fun confirmFreshness(ofStaged: Boolean, fetchedAt: Long) {
         val commit =
             lock.withLock {
-                if (state.closed) return
+                if (state.isClosed) return
                 if (ofStaged) {
                     // Staged metadata must never be combined with activated values.
                     state.staged = state.staged?.copy(fetchedAt = fetchedAt) ?: return
@@ -454,11 +532,17 @@ public class LeverClient internal constructor(
     internal fun cacheStore(): CacheStore = cache
 
     private fun checkOpen() {
-        check(!lock.withLock { state.closed }) { LeverRuntime.CLOSED_MESSAGE }
+        check(!lock.withLock { state.isClosed }) { LeverRuntime.CLOSED_MESSAGE }
     }
 
+    /**
+     * A read after `close()` still serves its value, but it must not start a
+     * new sink callback: "no sink invocation begins after `close()` returns" is
+     * the boundary, and a first post-close absent or mismatched read would
+     * otherwise cross it (spec 0003 §4).
+     */
     private fun logOnce(key: LogKey, level: LeverLogLevel, message: () -> String) {
-        val isFirst = lock.withLock { state.logged.add(key) }
+        val isFirst = lock.withLock { !state.isClosed && state.logged.add(key) }
         if (isFirst) config.logSink.log(level, message())
     }
 }

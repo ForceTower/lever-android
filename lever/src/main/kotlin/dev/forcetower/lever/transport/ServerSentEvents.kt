@@ -36,6 +36,15 @@ internal class ServerSentEventParser {
     private var frameBytes = 0
     private var pendingName: String? = null
     private var pendingData: String? = null
+    private var sawField = false
+
+    /**
+     * Frames terminated by a blank line, heartbeat comments included. The retry
+     * counter resets on a **frame**, not on bytes (spec 0002 §6.2): a peer that
+     * sends one byte and disconnects, over and over, must still back off.
+     */
+    var completedFrames: Int = 0
+        private set
 
     fun consume(chunk: ByteArray): List<Event> {
         // Checked before the bytes are appended, let alone turned into a
@@ -76,11 +85,16 @@ internal class ServerSentEventParser {
         if (line.isEmpty()) {
             val data = pendingData
             val name = pendingName
+            // A blank line between blank lines terminates nothing: only a frame
+            // that carried at least one field counts as received.
+            if (sawField) completedFrames++
+            sawField = false
             pendingName = null
             pendingData = null
             frameBytes = 0
             return data?.let { Event(name, it) }
         }
+        sawField = true
         // `:` starts a comment — this is what a heartbeat is.
         if (line[0] == COLON) return null
 

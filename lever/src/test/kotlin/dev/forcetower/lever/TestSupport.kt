@@ -144,6 +144,10 @@ internal class StreamScript(
 ) {
     private val chunks = Channel<ByteArray>(Channel.UNLIMITED)
 
+    /** How many times the runtime released this round's response. */
+    @Volatile var closes: Int = 0
+        private set
+
     val stream: HttpStream =
         HttpStream(
             status = status,
@@ -155,6 +159,7 @@ internal class StreamScript(
                     }
                 ),
             chunks = chunks.consumeAsFlow(),
+            onClose = { closes++ },
         )
 
     fun send(text: String) {
@@ -249,6 +254,9 @@ internal class ManualLifecycleSource(initial: LifecyclePhase = LifecyclePhase.FO
     @Volatile var unsubscriptions: Int = 0
         private set
 
+    @Volatile var detaches: Int = 0
+        private set
+
     /**
      * A `StateFlow` is the right shape for the seam: it hands the current phase
      * to every new collector and collapses repeats, exactly like the live
@@ -261,6 +269,10 @@ internal class ManualLifecycleSource(initial: LifecyclePhase = LifecyclePhase.FO
         } finally {
             unsubscriptions++
         }
+    }
+
+    override fun detach() {
+        detaches++
     }
 
     fun send(next: LifecyclePhase) {

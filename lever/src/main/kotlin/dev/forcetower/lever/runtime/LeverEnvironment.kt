@@ -4,6 +4,7 @@ import dev.forcetower.lever.ValidatedConfiguration
 import dev.forcetower.lever.transport.LeverTransport
 import dev.forcetower.lever.transport.OkHttpTransport
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExecutorCoroutineDispatcher
@@ -49,12 +50,23 @@ internal class LeverEnvironment(
          * cancellation has one owner (spec 0003 §4).
          */
         fun singleThreadRuntime(): RuntimeThread {
-            val dispatcher: ExecutorCoroutineDispatcher =
+            val executor =
                 Executors.newSingleThreadExecutor { runnable ->
                     Thread(runnable, "lever-runtime").apply { isDaemon = true }
                 }
-                    .asCoroutineDispatcher()
-            return RuntimeThread(dispatcher) { dispatcher.close() }
+            val dispatcher: ExecutorCoroutineDispatcher = executor.asCoroutineDispatcher()
+            return RuntimeThread(dispatcher) {
+                // `close()` shuts the executor down gracefully: the cancellation
+                // work already queued runs, and then the thread exits. Waiting
+                // for that is what makes "no callback after close() returns" a
+                // fact rather than a hope — bounded, so a wedged callback cannot
+                // turn teardown into a hang.
+                dispatcher.close()
+                executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            }
         }
+
+        /** Long enough for a cancelled call to unwind, short enough to notice. */
+        private const val SHUTDOWN_TIMEOUT_SECONDS = 2L
     }
 }

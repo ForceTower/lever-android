@@ -126,6 +126,25 @@ internal class SSETests {
     }
 
     @Test
+    fun `only frames terminated by a blank line count as received`() {
+        val parser = ServerSentEventParser()
+        assertEquals(0, parser.completedFrames)
+
+        parser.consume("event: version\ndata: {\"version\":1}\n\n")
+        assertEquals(1, parser.completedFrames, "a version frame")
+
+        parser.consume(": hb\n\n")
+        assertEquals(2, parser.completedFrames, "a heartbeat is a frame too")
+
+        // A field with no terminating blank line is not a frame yet.
+        parser.consume("data: half")
+        assertEquals(2, parser.completedFrames)
+        // …and blank lines between frames terminate nothing.
+        parser.consume("\n\n\n\n")
+        assertEquals(3, parser.completedFrames)
+    }
+
+    @Test
     fun `version frames decode, and garbage is ignored`() {
         assertEquals(42, VersionFrame.version("""{"version":42}"""))
         assertNull(VersionFrame.version("""{"version":"42"}"""))
@@ -318,6 +337,143 @@ internal class SSETests {
 
         assertEquals(logs, harness.sink.all.size, "teardown logged")
         assertEquals(1, harness.transport.streamRequests.size, "teardown reconnected")
+    }
+
+    // MARK: stream ownership
+
+    /**
+     * The response body is live from the headers onward, so every round
+     * releases it — rejected rounds included, or a reconnect cycle accumulates
+     * checked-out connections (review 0003 pass 3, P3-F2).
+     */
+    private fun TestScope.assertReleases(
+        script: StreamScript,
+        after: (TestHarness) -> Unit = {},
+    ) {
+        val harness = TestHarness(testScheduler).also { harnesses.add(it) }
+        harness.seedCache(1, mapOf("flag" to wireBool(false)))
+        harness.transport.enqueueStream(script.stream)
+
+        val client = harness.client()
+        try {
+            settle()
+            after(harness)
+            settle()
+            assertEquals(1, script.closes, "the round's response was not released exactly once")
+        } finally {
+            // Even on failure: an abandoned client would keep this test's virtual
+            // clock alive and turn one assertion into a minute of drain.
+            client.close()
+            settle()
+        }
+        assertEquals(1, script.closes, "teardown released it a second time")
+    }
+
+    @Test
+    fun `a rejected round releases its response`() = runTest {
+        assertReleases(StreamScript(status = 401))
+        assertReleases(StreamScript(status = 503, retryAfter = "120"))
+        assertReleases(StreamScript(status = 500))
+        assertReleases(StreamScript(contentType = "text/html"))
+        assertReleases(StreamScript(contentType = null))
+    }
+
+    @Test
+    fun `an accepted round releases its response on every ending`() = runTest {
+        // EOF, after a frame and after a heartbeat.
+        val afterFrame = StreamScript()
+        assertReleases(afterFrame) { _ ->
+            afterFrame.version(2)
+            settle()
+            afterFrame.close()
+        }
+        val eof = StreamScript()
+        assertReleases(eof) { _ ->
+            eof.heartbeat()
+            settle()
+            eof.close()
+        }
+
+        // The 1 MiB frame bound.
+        val oversized = StreamScript()
+        assertReleases(oversized) { _ ->
+            oversized.send("x".repeat(ServerSentEventParser.MAX_FRAME_BYTES + 1))
+        }
+
+        // The idle watchdog.
+        val idle = StreamScript()
+        assertReleases(idle) { _ -> advance(61.seconds) }
+
+        // Backgrounding.
+        val backgrounded = StreamScript()
+        assertReleases(backgrounded) { harness ->
+            harness.lifecycle.send(LifecyclePhase.BACKGROUND)
+        }
+    }
+
+    @Test
+    fun `client close releases the open round`() = runTest {
+        val harness = TestHarness(testScheduler).also { harnesses.add(it) }
+        harness.seedCache(1, mapOf("flag" to wireBool(false)))
+        val script = StreamScript()
+        harness.transport.enqueueStream(script.stream)
+
+        val client = harness.client()
+        settle()
+        assertEquals(0, script.closes, "the round is still open")
+
+        client.close()
+        settle()
+        assertEquals(1, script.closes)
+    }
+
+    // MARK: backoff
+
+    /**
+     * Spec 0002 §6.2 resets the retry counter on a **frame**, not on bytes: a
+     * peer that sends one byte and disconnects, over and over, must still back
+     * off (review 0003 pass 3, P3-F4).
+     */
+    @Test
+    fun `only a completed frame resets the retry counter`() = runTest {
+        val harness = TestHarness(testScheduler).also { harnesses.add(it) }
+        harness.seedCache(1, mapOf("flag" to wireBool(false)))
+
+        val silent = StreamScript().also { it.close() }
+        val partial = StreamScript()
+        val heartbeat = StreamScript()
+        harness.transport.enqueueStream(silent.stream)
+        harness.transport.enqueueStream(partial.stream)
+        harness.transport.enqueueStream(heartbeat.stream)
+        harness.transport.enqueueStream(StreamScript().stream)
+
+        val client = harness.client()
+        settle()
+        assertEquals(1, harness.transport.streamRequests.size)
+
+        // Round 1 received nothing: attempt 0 → 1 s.
+        advance(1.seconds)
+        assertEquals(2, harness.transport.streamRequests.size)
+
+        // Round 2 receives an unterminated line and dies. Bytes are not a frame,
+        // so the counter keeps growing: attempt 1 → 2 s.
+        partial.send("data: half")
+        settle()
+        partial.close()
+        settle()
+        advance(1.seconds)
+        assertEquals(2, harness.transport.streamRequests.size, "partial bytes reset the backoff")
+        advance(1.seconds)
+        assertEquals(3, harness.transport.streamRequests.size)
+
+        // Round 3 completes a heartbeat frame, which does reset: back to 1 s.
+        heartbeat.heartbeat()
+        settle()
+        heartbeat.close()
+        settle()
+        advance(1.seconds)
+        assertEquals(4, harness.transport.streamRequests.size, "a completed frame did not reset")
+        client.close()
     }
 
     // MARK: nudges

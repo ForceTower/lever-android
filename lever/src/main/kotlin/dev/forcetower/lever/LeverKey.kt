@@ -29,9 +29,15 @@ public class LeverKey<V> internal constructor(
     public val name: String,
     public val defaultValue: V,
     /**
-     * Part of the memo and log-dedupe identity: two keys may share a wire name
-     * with different Kotlin types, and a decoded value must never be served to
-     * a key expecting another type (spec 0002 §2.3).
+     * The log-dedupe identity and the `as=` tail of a mismatch warning. Two keys
+     * may share a wire name with different Kotlin types (spec 0002 §2.3).
+     *
+     * This is deliberately *not* the memo identity: a serializer's `serialName`
+     * is not a type identity — `List<String>` and `List<Int>` are both
+     * `kotlin.collections.ArrayList`, and two custom serializers may share a
+     * descriptor name on purpose. Colliding here costs a merged log line;
+     * colliding in the memo would serve one key's decoded object to another and
+     * throw `ClassCastException` at the call site.
      */
     internal val typeId: String,
     /** Only `json` keys memoize — the others are a branch, not a deserializer. */
