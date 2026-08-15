@@ -1,0 +1,29 @@
+name: Contract fixtures
+description: >
+  Checks out the lever monorepo at the SHA pinned in .contract-fixtures-sha and
+  exports LEVER_CONTRACT_FIXTURES. Bumping that file is the contract-sync act
+  (spec 0003 §1), so both the ci and publish workflows resolve it the same way —
+  a release must replay exactly the tapes ci replayed.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v5
+      with:
+        repository: ForceTower/lever
+        path: .contract-fixtures-repo
+        fetch-depth: 0
+
+    - name: Pin the fixtures to the recorded sha
+      shell: bash
+      run: |
+        set -euo pipefail
+        sha="$(tr -d '[:space:]' < .contract-fixtures-sha)"
+        git -C .contract-fixtures-repo checkout --quiet "$sha"
+        dir=".contract-fixtures-repo/packages/contract-fixtures/fixtures/http"
+        count="$(find "$dir" -name '*.json' | wc -l | tr -d ' ')"
+        if [ "$count" -lt 6 ]; then
+          echo "expected at least 6 http fixtures, found $count" >&2
+          exit 1
+        fi
+        echo "LEVER_CONTRACT_FIXTURES=$GITHUB_WORKSPACE/$dir" >> "$GITHUB_ENV"

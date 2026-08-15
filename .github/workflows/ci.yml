@@ -17,27 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The contract fixtures live in the lever monorepo, pinned by SHA.
-      # Bumping .contract-fixtures-sha is the contract-sync act (spec 0003 §1).
-      - name: Check out the pinned contract fixtures
-        uses: actions/checkout@v5
-        with:
-          repository: ForceTower/lever
-          path: .contract-fixtures-repo
-          fetch-depth: 0
-
-      - name: Pin the fixtures to the recorded sha
-        run: |
-          set -euo pipefail
-          sha="$(tr -d '[:space:]' < .contract-fixtures-sha)"
-          git -C .contract-fixtures-repo checkout --quiet "$sha"
-          dir=".contract-fixtures-repo/packages/contract-fixtures/fixtures/http"
-          count="$(find "$dir" -name '*.json' | wc -l | tr -d ' ')"
-          if [ "$count" -lt 6 ]; then
-            echo "expected at least 6 http fixtures, found $count" >&2
-            exit 1
-          fi
-          echo "LEVER_CONTRACT_FIXTURES=$GITHUB_WORKSPACE/$dir" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/contract-fixtures
 
       - uses: actions/setup-java@v5
         with:

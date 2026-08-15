@@ -5,20 +5,33 @@ on:
     tags: ["[0-9]+.[0-9]+.[0-9]+*"]
   workflow_dispatch:
     inputs:
-      dryRun:
-        description: "Build, sign, and upload a deployment without releasing it"
+      release:
+        description: "Release the deployment automatically instead of leaving it for review in the Portal"
         type: boolean
-        default: true
+        default: false
 
-# Central releases are immutable. The tag path publishes; the manual path
-# uploads a user-managed deployment that a human validates and then releases or
-# drops from the Portal (plan 0003 M1).
+# Central releases are immutable. A tag push releases; the manual path defaults
+# to a rehearsal that uploads a user-managed deployment for a human to validate
+# and then release or drop from the Portal (plan 0003 M1).
+permissions:
+  contents: read
+
+# Never two deployments of the same coordinates in flight.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: maven-central
     steps:
       - uses: actions/checkout@v5
+
+      # A release must replay exactly the tapes ci replayed: without them the
+      # contract suite skips itself, and the publish build would be a weaker
+      # check than the one that guarded the merge.
+      - uses: ./.github/actions/contract-fixtures
 
       - uses: actions/setup-java@v5
         with:
@@ -27,20 +40,44 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v5
 
-      - name: Check the tag against the published version
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Decide the release mode
+        id: mode
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${{ inputs.release }}" = "true" ]; then
+            echo "automatic=true" >> "$GITHUB_OUTPUT"
+            echo "task=publishAndReleaseToMavenCentral" >> "$GITHUB_OUTPUT"
+          else
+            echo "automatic=false" >> "$GITHUB_OUTPUT"
+            echo "task=publishToMavenCentral" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A released version is a promise the tag, the coordinates, and the frozen
+      # ABI all have to agree on before anything immutable happens.
+      - name: Check the version, the tag, and the frozen abi
+        if: steps.mode.outputs.automatic == 'true'
+        run: |
+          set -euo pipefail
           version="$(sed -n 's/^VERSION_NAME=//p' gradle.properties)"
-          if [ "$tag" != "$version" ]; then
-            echo "tag $tag does not match VERSION_NAME $version" >&2
+          if [ -z "$version" ]; then
+            echo "no VERSION_NAME in gradle.properties" >&2
+            exit 1
+          fi
+          case "$version" in
+            *-SNAPSHOT)
+              echo "refusing to release $version — a snapshot is not a release" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match VERSION_NAME $version" >&2
             exit 1
           fi
           if [ ! -f "lever/api/$version.api" ]; then
             echo "no frozen abi for $version — run ./gradlew :lever:apiFreeze" >&2
             exit 1
           fi
+          echo "releasing dev.forcetower.lever:lever-android:$version to Maven Central"
 
       - run: ./gradlew build --stacktrace
 
@@ -50,4 +87,12 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: ./gradlew publishToMavenCentral --no-configuration-cache --stacktrace
+        run: ./gradlew ${{ steps.mode.outputs.task }} --no-configuration-cache --stacktrace
+
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: publish-reports
+          path: |
+            **/build/reports/**
+            **/build/test-results/**

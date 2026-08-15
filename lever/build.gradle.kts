@@ -225,8 +225,17 @@ androidComponents.onVariants(androidComponents.selector().withName("release")) {
 }
 
 mavenPublishing {
+    // Which of the two upload tasks runs is the workflow's call:
+    // `publishToMavenCentral` leaves a user-managed deployment for a human to
+    // validate in the Portal, `publishAndReleaseToMavenCentral` releases it
+    // outright. A tag build does the latter (plan 0003 M1).
     publishToMavenCentral()
     signAllPublications()
+
+    // The artifactId would otherwise default to the Gradle project name (`lever`),
+    // and the coordinates consumers are promised in the README are immutable the
+    // moment the first release lands.
+    coordinates(artifactId = "lever-android")
 
     pom {
         name = "lever-android"
