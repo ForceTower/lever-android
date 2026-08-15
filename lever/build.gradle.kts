@@ -225,6 +225,20 @@ androidComponents.onVariants(androidComponents.selector().withName("release")) {
     tasks.named("check") { dependsOn(verify) }
 }
 
+// `VERSION_NAME` is the version under development, written plain. Only a release
+// build publishes it as-is; everything else appends `-SNAPSHOT`. Cutting a
+// release is then a tag, not a second edit of gradle.properties — and the
+// version can never be published bare by forgetting to put the suffix back.
+val publishedVersion =
+    providers.gradleProperty("VERSION_NAME").zip(
+        providers.gradleProperty("RELEASE").orElse("false"),
+    ) { declared, release ->
+        val base = declared.removeSuffix("-SNAPSHOT")
+        if (release.toBoolean()) base else "$base-SNAPSHOT"
+    }
+
+version = publishedVersion.get()
+
 mavenPublishing {
     // Which of the two upload tasks runs is the workflow's call:
     // `publishToMavenCentral` leaves a user-managed deployment for a human to
@@ -236,7 +250,7 @@ mavenPublishing {
     // The artifactId would otherwise default to the Gradle project name (`lever`),
     // and the coordinates consumers are promised in the README are immutable the
     // moment the first release lands.
-    coordinates(artifactId = "lever-android")
+    coordinates(artifactId = "lever-android", version = publishedVersion.get())
 
     pom {
         name = "lever-android"

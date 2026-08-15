@@ -36,38 +36,44 @@ lands can never be replaced, only superseded.
 
 ## Rehearsing without releasing
 
-Before the first real publication, prove the pipe end to end without making
-anything immutable. Run the `publish` workflow from the Actions tab with the
-`release` input left **off**: it builds, signs, and uploads a **user-managed
-deployment**. In the Portal, wait for it to reach `VALIDATED`, resolve it by
-coordinates from a consumer through the Portal's authenticated manual-testing
-repository, and then **drop** the deployment.
+Prove the pipe end to end without making anything immutable. Run the `publish`
+workflow from the Actions tab with the `release` input left **off**: it builds
+and signs the bare `VERSION_NAME` and uploads a **user-managed deployment**. In
+the Portal, wait for it to reach `VALIDATED`, resolve it by coordinates from a
+consumer through the Portal's authenticated manual-testing repository, and then
+**drop** the deployment — a rehearsal that is never dropped will collide with
+the release of the same version.
 
 The local equivalent, which needs the credentials as Gradle properties:
 
 ```bash
-./gradlew publishToMavenCentral --no-configuration-cache
+./gradlew publishToMavenCentral -PRELEASE=true --no-configuration-cache
 ```
 
-A rehearsal only produces a deployment when `VERSION_NAME` is not a
-`-SNAPSHOT`; snapshots go to Central's snapshot repository instead.
+## Versions
+
+`VERSION_NAME` in `gradle.properties` is the version **under development**,
+written bare (`0.2.0`). Every build appends `-SNAPSHOT` unless it is given
+`-PRELEASE=true`, which only the `publish` workflow does. So there is no suffix
+to strip before a release and none to put back afterwards — the one edit per
+cycle is bumping to the next version, and forgetting it cannot publish a bare
+version by accident.
 
 ## Cutting a release
 
 1. Land everything, with `./gradlew build` green (unit suites, lint, the ABI
    check, and the sample's minified build).
-2. Set `VERSION_NAME` in `gradle.properties` to the release version (no
-   `-SNAPSHOT`).
+2. Check that `VERSION_NAME` is the version you mean to release.
 3. `./gradlew :lever:apiDump && ./gradlew :lever:apiFreeze` — the first accepts
    the current surface into `api/current.api`, the second freezes
    `api/<version>.api` as history. Review both diffs: this is the moment the
    public API becomes a promise.
 4. Commit, tag `<version>`, push the tag. The `publish` workflow checks that the
-   tag matches `VERSION_NAME`, that the version is not a snapshot, and that the
-   frozen ABI exists; then it builds, signs, and **releases to Central
-   automatically** (`publishAndReleaseToMavenCentral`). There is no button to
-   press afterwards and nothing to take back.
-5. Bump `VERSION_NAME` to the next `-SNAPSHOT`.
+   tag matches `VERSION_NAME` and that the frozen ABI exists; then it builds,
+   signs, and **releases to Central automatically**
+   (`publishAndReleaseToMavenCentral`). There is no button to press afterwards
+   and nothing to take back.
+5. Bump `VERSION_NAME` to the next version.
 
 The manual `workflow_dispatch` path defaults to the rehearsal above; ticking its
 `release` input runs the same guards and releases outright, which is the escape

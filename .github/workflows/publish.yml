@@ -53,9 +53,10 @@ jobs:
           fi
 
       # A released version is a promise the tag, the coordinates, and the frozen
-      # ABI all have to agree on before anything immutable happens.
+      # ABI all have to agree on before anything immutable happens. Both paths
+      # build the bare version — the rehearsal uploads a real deployment, which
+      # is the only way to rehearse what the Portal actually does with one.
       - name: Check the version, the tag, and the frozen abi
-        if: steps.mode.outputs.automatic == 'true'
         run: |
           set -euo pipefail
           version="$(sed -n 's/^VERSION_NAME=//p' gradle.properties)"
@@ -63,23 +64,28 @@ jobs:
             echo "no VERSION_NAME in gradle.properties" >&2
             exit 1
           fi
+          # The suffix is the build's to add, never the file's to carry.
           case "$version" in
             *-SNAPSHOT)
-              echo "refusing to release $version — a snapshot is not a release" >&2
+              echo "VERSION_NAME is $version — write it bare; -SNAPSHOT is appended" >&2
               exit 1
               ;;
           esac
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$version" ]; then
-            echo "tag ${GITHUB_REF_NAME} does not match VERSION_NAME $version" >&2
-            exit 1
+          if [ "${{ steps.mode.outputs.automatic }}" = "true" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "$version" ]; then
+              echo "tag ${GITHUB_REF_NAME} does not match VERSION_NAME $version" >&2
+              exit 1
+            fi
+            if [ ! -f "lever/api/$version.api" ]; then
+              echo "no frozen abi for $version — run ./gradlew :lever:apiFreeze" >&2
+              exit 1
+            fi
+            echo "releasing dev.forcetower.lever:lever-android:$version to Maven Central"
+          else
+            echo "rehearsing dev.forcetower.lever:lever-android:$version as a user-managed deployment"
           fi
-          if [ ! -f "lever/api/$version.api" ]; then
-            echo "no frozen abi for $version — run ./gradlew :lever:apiFreeze" >&2
-            exit 1
-          fi
-          echo "releasing dev.forcetower.lever:lever-android:$version to Maven Central"
 
-      - run: ./gradlew build --stacktrace
+      - run: ./gradlew build -PRELEASE=true --stacktrace
 
       - name: Publish to Maven Central
         env:
@@ -87,7 +93,7 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
-        run: ./gradlew ${{ steps.mode.outputs.task }} --no-configuration-cache --stacktrace
+        run: ./gradlew ${{ steps.mode.outputs.task }} -PRELEASE=true --no-configuration-cache --stacktrace
 
       - uses: actions/upload-artifact@v5
         if: failure()
